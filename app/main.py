@@ -6,17 +6,32 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .schemas import LayerOut, SolveRequest, SolveResponse
-from .solver import LayerInput, SolverError, solve_free_thermal_bending
+from .schemas import (
+    LayerOut,
+    RangeControlOut,
+    SafeRangeRequest,
+    SafeRangeResponse,
+    SolveRequest,
+    SolveResponse,
+)
+from .solver import (
+    LayerInput,
+    SolverError,
+    StressLimits,
+    safe_temperature_range as solve_safe_temperature_range,
+    solve_free_thermal_bending,
+)
 
 app = FastAPI(
     title="Composite Laminate Thermal Bending API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Solves free thermal bending of a composite laminate: given layers "
         "(bottom to top) with thickness, Young's modulus and CTE, plus a "
         "uniform temperature change, returns the bottom strain, curvature "
-        "and the stress at the bottom/top surface of every layer."
+        "and the stress at the bottom/top surface of every layer. Also "
+        "computes the largest temperature-change interval around zero that "
+        "keeps every surface stress within per-layer allowables."
     ),
 )
 
@@ -64,4 +79,40 @@ def solve(request: SolveRequest) -> SolveResponse:
             )
             for r in result.layers
         ],
+    )
+
+
+@app.post(
+    "/safe-temperature-range",
+    response_model=SafeRangeResponse,
+    summary="Largest temperature-change interval within stress limits",
+)
+def safe_temperature_range(request: SafeRangeRequest) -> SafeRangeResponse:
+    layers = [
+        LayerInput(thickness=l.thickness, modulus=l.modulus, cte=l.cte)
+        for l in request.layers
+    ]
+    limits = [
+        StressLimits(
+            tensile=l.tensile_allowable,
+            compressive=l.compressive_allowable,
+        )
+        for l in request.layers
+    ]
+    result = solve_safe_temperature_range(layers, limits)
+
+    def control_out(control):
+        if control is None:
+            return None
+        return RangeControlOut(
+            layer_index=control.layer_index,
+            surface=control.surface,
+            stress_type=control.stress_type,
+        )
+
+    return SafeRangeResponse(
+        delta_t_min=result.delta_t_min,
+        delta_t_max=result.delta_t_max,
+        min_control=control_out(result.min_control),
+        max_control=control_out(result.max_control),
     )
