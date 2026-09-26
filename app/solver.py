@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 
 class SolverError(ValueError):
@@ -156,3 +156,131 @@ def solve_free_thermal_bending(
         )
 
     return SolveResult(bottom_strain=eps0, curvature=kappa, layers=results)
+
+
+@dataclass(frozen=True)
+class RatedLayerInput:
+    """One material layer with stress allowables.
+
+    thickness:              layer thickness (> 0).
+    modulus:                Young's modulus (> 0).
+    cte:                    coefficient of thermal expansion (finite).
+    tensile_allowable:      maximum tensile stress (> 0, finite).
+    compressive_allowable:  maximum compressive stress magnitude (> 0, finite).
+    """
+
+    thickness: float
+    modulus: float
+    cte: float
+    tensile_allowable: float
+    compressive_allowable: float
+
+
+@dataclass(frozen=True)
+class BoundControl:
+    """Which layer surface and stress type sets one interval bound."""
+
+    layer_index: int
+    surface: str  # "bottom" or "top"
+    stress_type: str  # "tension" or "compression"
+
+
+@dataclass(frozen=True)
+class SafeRangeResult:
+    """Largest temperature-change interval around zero within allowables.
+
+    delta_t_min / delta_t_max are None when unbounded (no layer surface
+    constrains that side); the matching control is then None as well.
+    """
+
+    delta_t_min: Optional[float]
+    delta_t_max: Optional[float]
+    lower_control: Optional[BoundControl]
+    upper_control: Optional[BoundControl]
+
+
+def safe_temperature_range(layers: List[RatedLayerInput]) -> SafeRangeResult:
+    """Largest continuous dT interval around 0 within all stress allowables.
+
+    The laminate is stress-free at dT = 0 and every surface stress is linear
+    in dT, so the stress at each layer surface is ``k * dT`` with a constant
+    slope ``k``. Each surface therefore imposes
+
+        -compressive_allowable <= k * dT <= tensile_allowable
+
+    which, for ``k != 0``, gives exactly one lower and one upper candidate
+    bound; a zero slope constrains nothing. The feasible set is the interval
+    between the tightest candidates, which always contains dT = 0.
+
+    Args:
+        layers: at least two layers, ordered bottom to top, each with
+            finite, strictly positive tensile/compressive allowables.
+
+    Returns:
+        SafeRangeResult with the interval bounds (None = unbounded) and,
+        for each finite bound, the controlling layer, surface and stress
+        type. Ties are broken by layer order, bottom surface first.
+
+    Raises:
+        SolverError: if inputs are inconsistent or the system is singular.
+    """
+    if len(layers) < 2:
+        raise SolverError("at least two layers are required")
+    for i, layer in enumerate(layers):
+        for name, value in (
+            ("tensile_allowable", layer.tensile_allowable),
+            ("compressive_allowable", layer.compressive_allowable),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise SolverError(
+                    f"layer {i}: {name} must be finite and strictly positive"
+                )
+
+    # Stresses are homogeneous linear in dT, so solving at dT = 1 yields the
+    # per-surface slopes directly.
+    unit = solve_free_thermal_bending(
+        [LayerInput(l.thickness, l.modulus, l.cte) for l in layers], 1.0
+    )
+
+    upper = math.inf
+    lower = -math.inf
+    upper_control: Optional[BoundControl] = None
+    lower_control: Optional[BoundControl] = None
+
+    for i, (layer, res) in enumerate(zip(layers, unit.layers)):
+        for surface, z, slope in (
+            ("bottom", res.z_bottom, res.stress_bottom),
+            ("top", res.z_top, res.stress_top),
+        ):
+            # A slope is treated as zero only when it is negligible against
+            # the magnitude of its own constituents (exact cancellation, e.g.
+            # identical layers); genuine slopes always clear this threshold.
+            scale = layer.modulus * (
+                abs(unit.bottom_strain) + abs(unit.curvature) * z + abs(layer.cte)
+            )
+            if abs(slope) <= 1e-9 * scale:
+                continue
+            if slope > 0.0:
+                # Heating drives tension, cooling drives compression.
+                cand_upper = layer.tensile_allowable / slope
+                cand_lower = -layer.compressive_allowable / slope
+                type_upper, type_lower = "tension", "compression"
+            else:
+                cand_upper = -layer.compressive_allowable / slope
+                cand_lower = layer.tensile_allowable / slope
+                type_upper, type_lower = "compression", "tension"
+            # Strict comparisons: the first surface to reach a bound keeps
+            # it, i.e. ties go to the lowest layer, bottom surface first.
+            if cand_upper < upper:
+                upper = cand_upper
+                upper_control = BoundControl(i, surface, type_upper)
+            if cand_lower > lower:
+                lower = cand_lower
+                lower_control = BoundControl(i, surface, type_lower)
+
+    return SafeRangeResult(
+        delta_t_min=None if lower_control is None else lower,
+        delta_t_max=None if upper_control is None else upper,
+        lower_control=lower_control,
+        upper_control=upper_control,
+    )
